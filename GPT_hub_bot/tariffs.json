@@ -1,0 +1,29 @@
+{
+    "basic": {
+      "name": "Базовый",
+      "price_rub": 399,
+      "duration_days": 30,
+      "description": "Доступ к текстовым ботам (писать, болтать, учиться)",
+      "limits": {
+        "image_generations_per_day": 0
+      }
+    },
+    "pro": {
+      "name": "Профи",
+      "price_rub": 599,
+      "duration_days": 30,
+      "description": "Безлимит на тексты + 10 изображений в день",
+      "limits": {
+        "image_generations_per_day": 10
+      }
+    },
+    "image_pack": {
+      "name": "Пакет 10 картинок",
+      "price_rub": 99,
+      "duration_days": null,
+      "description": "Дополнительные 10 генераций изображений (единоразово)",
+      "limits": {
+        "image_generations": 10
+      }
+    }
+  }

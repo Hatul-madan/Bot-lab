@@ -7,11 +7,22 @@ from telegram.ext import (
     ContextTypes, filters
 )
 import openai
+import json
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
+
+def load_tariffs():
+    try:
+        with open('tariffs.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+# Загружаем тарифы при запуске
+TARIFFS = load_tariffs()
 
 # ——— Вспомогательные функции ———
 
@@ -62,6 +73,21 @@ def get_role_header(mode):
     }
     return f"{role_names.get(mode, '🤖 Бот')} — сейчас ты общаешься с этим ботом.\n"
 
+def format_tariffs():
+    if not TARIFFS:
+        return "⚠️ Тарифы временно недоступны."
+    
+    result = "🎯 Доступные тарифы:\n\n"
+    for tariff_id, tariff in TARIFFS.items():
+        result += f"📦 {tariff['name']}\n"
+        result += f"💰 {tariff['price_rub']} ₽"
+        if tariff['duration_days']:
+            result += f" / {tariff['duration_days']} дней"
+        result += "\n"
+        result += f"📝 {tariff['description']}\n\n"
+    
+    return result
+
 # ——— Главное меню выбора бота ———
 
 async def show_menu(query, context):
@@ -73,7 +99,7 @@ async def show_menu(query, context):
         [InlineKeyboardButton("💡 Советовать", callback_data="advise")],
         [InlineKeyboardButton("🧠 Автоматизировать", callback_data="automate")],
         [InlineKeyboardButton("🎉 Развлекать", callback_data="entertain")],
-        [InlineKeyboardButton("🚪 В НИИИИИИИИ", url="https://t.me/your_nii_bot")]
+        [InlineKeyboardButton("💳 Тарифы", callback_data="pricing")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     menu_text = (
@@ -182,6 +208,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["mode"] = "entertain"
     elif query.data == "home":
         await show_menu(query, context)
+    elif query.data == "pricing":
+        keyboard = [[InlineKeyboardButton("🤖 Выбрать другого бота", callback_data="home")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            format_tariffs(),
+            reply_markup=reply_markup
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_mode = context.user_data.get("mode")

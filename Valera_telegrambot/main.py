@@ -2,9 +2,10 @@ import os
 import openai
 import json
 import re
-from typing import Dict, List, Union
+import random
+from typing import Dict, List
 from dotenv import load_dotenv
-from telegram import Update, User, Message
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, ContextTypes, filters
@@ -82,6 +83,20 @@ characters = load_characters()
 user_memory: Dict[int, List[Dict[str, str]]] = {}
 user_gender: Dict[int, str] = {}
 user_state: Dict[int, str] = {}
+message_counter: Dict[int, int] = {}  # Счетчик сообщений для каждого пользователя
+
+def load_promo_messages() -> List[str]:
+    """Загружает промо-сообщения из файла"""
+    try:
+        with open("promo_messages.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("messages", [])
+    except Exception as e:
+        print(f"Ошибка загрузки promo_messages.json: {e}")
+        return []
+
+# Загружаем промо-сообщения при старте
+promo_messages = load_promo_messages()
 
 
 def guess_gender_by_name(name: str) -> str:
@@ -166,6 +181,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gender = guess_gender_by_name(first_name)
     user_gender[user_id] = gender
     user_memory[user_id] = []
+    message_counter[user_id] = 0
     
     if gender in ["male", "female"]:
         user_state[user_id] = "determined"
@@ -180,8 +196,9 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name or ""
     
-    # Очищаем память
+    # Очищаем память и счетчик
     user_memory[user_id] = []
+    message_counter[user_id] = 0
     
     # Заново определяем пол по имени из профиля
     gender = guess_gender_by_name(first_name)
@@ -279,6 +296,9 @@ async def generate_response(user_id: int, text: str) -> str:
     """Генерирует ответ с учётом пола пользователя"""
     gender = user_gender.get(user_id, "unknown")
     
+    # Обновляем счетчик сообщений
+    message_counter[user_id] = message_counter.get(user_id, 0) + 1
+    
     # Формируем системный промпт
     system_prompt = build_system_prompt(gender)
     
@@ -291,13 +311,19 @@ async def generate_response(user_id: int, text: str) -> str:
     # Запрос к OpenAI
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4",
             messages=messages
         )
         reply = response.choices[0].message.content.strip()
         
         # Добавляем в память
         user_memory[user_id].append({"role": "assistant", "content": reply})
+        
+        # Проверяем, нужно ли добавить промо-сообщение
+        if (message_counter[user_id] % random.randint(10, 15) == 0 and 
+            promo_messages):
+            promo = random.choice(promo_messages)
+            reply = f"{reply}\n\n{promo}"
         
         return reply
     except Exception:
