@@ -311,7 +311,7 @@ async def generate_response(user_id: int, text: str) -> str:
     # Запрос к OpenAI
     try:
         response = openai.chat.completions.create(
-            model="gpt-4",
+            model="gpt-4о",
             messages=messages
         )
         reply = response.choices[0].message.content.strip()
