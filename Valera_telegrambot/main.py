@@ -1,181 +1,318 @@
 import os
 import openai
 import json
+import re
+from typing import Dict, List, Union
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, User, Message
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, ContextTypes, filters
 )
-from users import init_db, add_user, get_stats
-from petrovich.main import Petrovich
 
-# --- Petrovich instance
-p = Petrovich()
-
+# --- INIT ---
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai.api_key = OPENAI_API_KEY
 
-# Память и режимы
-user_memory = {}
-user_modes = {}
 
-# Загрузка персонажей из файла
-with open("characters.json", "r", encoding="utf-8") as f:
-    modes = json.load(f)
+# --- Загрузка словаря имён ---
+def load_name_gender_map() -> Dict[str, str]:
+    try:
+        with open("name_gender_map.json", "r", encoding="utf-8") as f:
+            raw_map = json.load(f)
+            name_map = {}
+            
+            # Обработка мужских имён
+            male_names = raw_map.get(
+                "// МУЖСКИЕ ИМЕНА", {}
+            )
+            for full_name, variations in male_names.items():
+                for name, gender in variations.items():
+                    name_map[name.lower()] = gender
+            
+            # Обработка женских имён
+            female_names = raw_map.get(
+                "// ЖЕНСКИЕ ИМЕНА", {}
+            )
+            for full_name, variations in female_names.items():
+                for name, gender in variations.items():
+                    name_map[name.lower()] = gender
+            
+            # Обработка неопределённых имён
+            unknown_names = raw_map.get(
+                "// ИМЕНА, КОТОРЫЕ МОГУТ БЫТЬ И МУЖСКИМИ И ЖЕНСКИМИ", 
+                {}
+            )
+            for full_name, variations in unknown_names.items():
+                for name, gender in variations.items():
+                    name_map[name.lower()] = gender
+            
+            return name_map
+    except Exception as e:
+        print(
+            f"Ошибка загрузки name_gender_map.json: {e}. "
+            "Использую базовый словарь."
+        )
+        return {
+            "сергей": "male", "евгений": "male", "александр": "male",
+            "анна": "female", "мария": "female", "елена": "female"
+        }
 
-def guess_gender(name):
-    """Определяет пол по имени, используя Petrovich."""
-    if not name or len(name) < 2:
+
+# --- Загрузка промптов ---
+def load_characters():
+    try:
+        with open("characters.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        print("Ошибка загрузки characters.json. Использую базовый промпт.")
+        return {
+            "Валера": ("Тебя зовут Валера. Ты грубый, раздражённый, "
+                      "и язвительный ИИ. Отвечай коротко и резко.")
+        }
+
+
+# Загружаем данные при старте
+name_gender_map = load_name_gender_map()
+characters = load_characters()
+
+# --- Глобальные переменные ---
+user_memory: Dict[int, List[Dict[str, str]]] = {}
+user_gender: Dict[int, str] = {}
+user_state: Dict[int, str] = {}
+
+
+def guess_gender_by_name(name: str) -> str:
+    """Определяет пол по имени из словаря"""
+    if not name:
         return "unknown"
-    gender = p.firstname.gender(name)
-    if gender not in ("male", "female"):
-        return "unknown"
-    return gender
+    
+    # Берём только первое слово (имя без фамилии)
+    first_word = name.strip().split()[0] if name.strip() else ""
+    clean_name = first_word.lower()
+    
+    return name_gender_map.get(clean_name, "unknown")
 
-# /start
+
+def extract_name_from_text(text: str) -> str:
+    """Извлекает имя из текста пользователя"""
+    text = text.strip()
+    
+    # Паттерны для поиска имени
+    patterns = [
+        r'меня зовут\s+([А-ЯЁ][а-яё]+)',
+        r'я\s+([А-ЯЁ][а-яё]+)',
+        r'зовут\s+([А-ЯЁ][а-яё]+)',
+        r'\b([А-ЯЁ][а-яё]+)\b'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            name = match.group(1)
+            # Исключаем служебные слова
+            excluded = ['меня', 'зовут', 'тебя', 'как', 'что', 'где', 'когда']
+            if name.lower() not in excluded:
+                return name
+    
+    return ""
+
+
+def detect_gender_from_response(text: str) -> str:
+    """Определяет пол из прямого ответа"""
+    text_lower = text.lower()
+    
+    male_words = ['мальчик', 'парень', 'мужчина', 'я мальчик', 'я парень']
+    female_words = ['девочка', 'женщина', 'девушка', 'я девочка', 'я девушка']
+    
+    for word in male_words:
+        if word in text_lower:
+            return "male"
+    
+    for word in female_words:
+        if word in text_lower:
+            return "female"
+    
+    return "unknown"
+
+
+def build_system_prompt(gender: str) -> str:
+    """Создаёт системный промпт с учётом пола"""
+    if gender == "male":
+        gender_info = "Пол собеседника: мужской."
+    elif gender == "female":
+        gender_info = "Пол собеседника: женский."
+    else:
+        gender_info = "Пол собеседника: неизвестно."
+    
+    # Берём промпт "Валера" из characters.json
+    base_prompt = characters.get("Валера", 
+                                "Ты Валера, грубый помощник.")
+    
+    return f"{base_prompt}\n{gender_info}"
+
+
+# --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user is None:
+        return
+    
     user_id = update.effective_user.id
-    username = update.effective_user.username or ""
     first_name = update.effective_user.first_name or ""
-    add_user(user_id, username)
+    
+    # Пытаемся определить пол по имени из профиля
+    gender = guess_gender_by_name(first_name)
+    user_gender[user_id] = gender
+    user_memory[user_id] = []
+    
+    if gender in ["male", "female"]:
+        user_state[user_id] = "determined"
+    else:
+        user_state[user_id] = "initial"
+    
+    if update.message:
+        await update.message.reply_text("Че надо?")
 
-    gender = guess_gender(first_name)
-    # Дуракоустойчивость: имя должно быть не короче 2 символов, пол определён
-    if not first_name or len(first_name) < 2 or gender == "unknown":
-        first_name = ""
-        gender = "unknown"
-    user_memory[user_id] = {
-        "history": [],
-        "name": first_name,
-        "gender": gender,
-        "asked_name": False
-    }
-    await update.message.reply_text("Че надо?")
 
-# /reset
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name or ""
-    gender = guess_gender(first_name)
-    if not first_name or len(first_name) < 2 or gender == "unknown":
-        first_name = ""
-        gender = "unknown"
-    user_memory[user_id] = {
-        "history": [],
-        "name": first_name,
-        "gender": gender,
-        "asked_name": False
-    }
+    
+    # Очищаем память
+    user_memory[user_id] = []
+    
+    # Заново определяем пол по имени из профиля
+    gender = guess_gender_by_name(first_name)
+    user_gender[user_id] = gender
+    
+    # Устанавливаем правильное состояние
+    if gender in ["male", "female"]:
+        user_state[user_id] = "determined"
+    else:
+        user_state[user_id] = "initial"
+    
     await update.message.reply_text("🔄 Память очищена!\nЧе надо?")
 
-# /mode
-async def set_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = context.args
-    if not args:
-        await update.message.reply_text("❗ Укажи режим: /mode хам | секретарь | няша")
-        return
 
-    mode = args[0].lower()
-    if mode not in modes:
-        await update.message.reply_text("❗ Неизвестный режим.")
-        return
-
-    user_modes[user_id] = mode
-    await update.message.reply_text(f"✅ Режим установлен: {mode}")
-
-# /stats
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total, today, week = get_stats()
-    await update.message.reply_text(
-        f"👥 Всего пользователей: {total}\n"
-        f"📅 Сегодня: {today}\n"
-        f"📆 За 7 дней: {week}"
-    )
-
-# /reload_modes
-async def reload_modes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global modes
-    try:
-        with open("characters.json", "r", encoding="utf-8") as f:
-            modes = json.load(f)
-        await update.message.reply_text(f"🔁 Персонажи перезагружены. Загружено стилей: {len(modes)}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при загрузке: {e}")
-
-# --- Имя юзера (только если не определили сразу)
-async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_input = update.message.text.strip()
-    gender = guess_gender(user_input)
-    if gender == "unknown":
-        user_memory[user_id]["name"] = ""
-        user_memory[user_id]["gender"] = "unknown"
-        user_memory[user_id]["asked_name"] = True
-        await update.message.reply_text("Имя что-то странное. Назови себя нормально!")
-        return
-    user_memory[user_id]["name"] = user_input
-    user_memory[user_id]["gender"] = gender
-    user_memory[user_id]["asked_name"] = True
-    await update.message.reply_text("Принято. Че надо?")
-
-# Основной обработчик сообщений
+# --- Основной обработчик ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_input = update.message.text.strip()
-
-    memory = user_memory.get(user_id)
-
-    # 1. Если ещё не определён пол, и имя из профиля отсутствует или не сработало — уточняем имя (но не сразу!)
-    if memory:
-        if memory.get("gender", "unknown") == "unknown" and not memory.get("asked_name"):
-            user_memory[user_id]["asked_name"] = True
-            await update.message.reply_text("Кстати, я Валера. А тебя как звать?")
+    text = update.message.text.strip()
+    
+    # Инициализация если пользователь новый
+    if user_id not in user_state:
+        user_state[user_id] = "initial"
+        user_gender[user_id] = "unknown"
+        user_memory[user_id] = []
+    
+    state = user_state[user_id]
+    gender = user_gender[user_id]
+    
+    # Логика по состояниям
+    if state == "initial":
+        # Первое сообщение
+        user_memory[user_id].append({"role": "user", "content": text})
+        response_text = await generate_response(user_id, text)
+        await update.message.reply_text(response_text)
+        user_state[user_id] = "waiting_name"
+        
+    elif state == "waiting_name":
+        # Второе сообщение - спрашиваем имя
+        user_memory[user_id].append({"role": "user", "content": text})
+        response_text = await generate_response(user_id, text)
+        
+        # Добавляем вопрос об имени
+        full_response = (f"{response_text}\n\n"
+                        "Кстати, я Валера. А тебя как звать?")
+        await update.message.reply_text(full_response)
+        user_state[user_id] = "analyzing_name"
+        
+    elif state == "analyzing_name":
+        # Анализируем ответ на вопрос об имени
+        user_memory[user_id].append({"role": "user", "content": text})
+        
+        extracted_name = extract_name_from_text(text)
+        if extracted_name:
+            gender = guess_gender_by_name(extracted_name)
+            user_gender[user_id] = gender
+            
+            if gender in ["male", "female"]:
+                user_state[user_id] = "determined"
+                await update.message.reply_text("Ок, понял.")
+                return
+            else:
+                user_state[user_id] = "waiting_gender"
+                await update.message.reply_text(
+                    "Не понял. Это ты мальчик, или девочка?")
+                return
+        else:
+            user_state[user_id] = "waiting_gender"
+            await update.message.reply_text(
+                "Не понял. Это ты мальчик, или девочка?")
             return
-        elif memory.get("gender", "unknown") == "unknown" and memory.get("asked_name"):
-            await handle_name(update, context)
+            
+    elif state == "waiting_gender":
+        # Анализируем прямой ответ о поле
+        detected_gender = detect_gender_from_response(text)
+        
+        if detected_gender in ["male", "female"]:
+            user_gender[user_id] = detected_gender
+            user_state[user_id] = "determined"
+            await update.message.reply_text("Ок, понял.")
             return
+        else:
+            user_gender[user_id] = "unknown"
+            user_state[user_id] = "determined"
+            await update.message.reply_text("Ладно, фиг с тобой.")
+            return
+    
+    elif state == "determined":
+        # Обычное общение
+        user_memory[user_id].append({"role": "user", "content": text})
+        response_text = await generate_response(user_id, text)
+        await update.message.reply_text(response_text)
 
-    # --- Дальше стандартный диалог, имя НЕ вставляем, только используем пол для правильной грамматики
-    mode = user_modes.get(user_id, "default")
-    system_prompt = modes.get(mode, modes["default"])
 
-    history = memory.get("history", []) if memory else []
+async def generate_response(user_id: int, text: str) -> str:
+    """Генерирует ответ с учётом пола пользователя"""
+    gender = user_gender.get(user_id, "unknown")
+    
+    # Формируем системный промпт
+    system_prompt = build_system_prompt(gender)
+    
+    # История сообщений
+    history = user_memory.get(user_id, [])
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history[-15:])
-    messages.append({"role": "user", "content": user_input})
+    messages.append({"role": "user", "content": text})
+    
+    # Запрос к OpenAI
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=messages
+        )
+        reply = response.choices[0].message.content.strip()
+        
+        # Добавляем в память
+        user_memory[user_id].append({"role": "assistant", "content": reply})
+        
+        return reply
+    except Exception:
+        return "Чет у меня глюк. Попробуй еще раз."
 
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=messages
-    )
 
-    reply = response.choices[0].message.content.strip()
-
-    if memory is not None:
-        history.append({"role": "user", "content": user_input})
-        history.append({"role": "assistant", "content": reply})
-        user_memory[user_id]["history"] = history
-
-    await update.message.reply_text(reply)
-
-# --- Запуск
+# --- Запуск ---
 def main():
-    init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("mode", set_mode))
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("reload_modes", reload_modes))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, 
+                                  handle_message))
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
