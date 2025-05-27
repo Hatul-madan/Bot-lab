@@ -3,13 +3,19 @@ import openai
 import json
 import re
 import random
-from typing import Dict, List
+from typing import Dict, List, TypedDict, Literal
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler,
     MessageHandler, ContextTypes, filters
 )
+
+
+class ChatMessage(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
 
 # --- INIT ---
 load_dotenv()
@@ -70,8 +76,14 @@ def load_characters():
     except Exception:
         print("Ошибка загрузки characters.json. Использую базовый промпт.")
         return {
-            "Валера": ("Тебя зовут Валера. Ты грубый, раздражённый, "
-                      "и язвительный ИИ. Отвечай коротко и резко.")
+            "valera": {
+                "prompt": (
+                    "Тебя зовут Валера. Ты грубый, раздражённый, "
+                    "и язвительный ИИ. Отвечай коротко и резко."
+                ),
+                "model": "gpt-4o",
+                "temperature": 0.9
+            }
         }
 
 
@@ -79,11 +91,14 @@ def load_characters():
 name_gender_map = load_name_gender_map()
 characters = load_characters()
 
+
 # --- Глобальные переменные ---
-user_memory: Dict[int, List[Dict[str, str]]] = {}
+user_memory: Dict[int, List[ChatMessage]] = {}
 user_gender: Dict[int, str] = {}
 user_state: Dict[int, str] = {}
-message_counter: Dict[int, int] = {}  # Счетчик сообщений для каждого пользователя
+# Счетчик сообщений для каждого пользователя
+message_counter: Dict[int, int] = {}
+
 
 def load_promo_messages() -> List[str]:
     """Загружает промо-сообщения из файла"""
@@ -94,6 +109,7 @@ def load_promo_messages() -> List[str]:
     except Exception as e:
         print(f"Ошибка загрузки promo_messages.json: {e}")
         return []
+
 
 # Загружаем промо-сообщения при старте
 promo_messages = load_promo_messages()
@@ -162,16 +178,22 @@ def build_system_prompt(gender: str) -> str:
     else:
         gender_info = "Пол собеседника: неизвестно."
     
-    # Берём промпт "Валера" из characters.json
-    base_prompt = characters.get("Валера", 
-                                "Ты Валера, грубый помощник.")
+    # Берём промпт "valera" из characters.json
+    char_config = characters.get("valera", {
+        "prompt": [
+            "Ты Валера, грубый помощник."
+        ]
+    })
+    
+    # Объединяем строки промпта
+    base_prompt = " ".join(char_config["prompt"])
     
     return f"{base_prompt}\n{gender_info}"
 
 
 # --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user is None:
+    if not update.effective_user or not update.message:
         return
     
     user_id = update.effective_user.id
@@ -188,11 +210,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user_state[user_id] = "initial"
     
-    if update.message:
-        await update.message.reply_text("Че надо?")
+    await update.message.reply_text("Че надо?")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
     first_name = update.effective_user.first_name or ""
     
@@ -215,8 +239,14 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Основной обработчик ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
+    
     user_id = update.effective_user.id
-    text = update.message.text.strip()
+    text = update.message.text
+    if not text:
+        return
+    text = text.strip()
     
     # Инициализация если пользователь новый
     if user_id not in user_state:
@@ -241,8 +271,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response_text = await generate_response(user_id, text)
         
         # Добавляем вопрос об имени
-        full_response = (f"{response_text}\n\n"
-                        "Кстати, я Валера. А тебя как звать?")
+        full_response = (
+            f"{response_text}\n\n"
+            "Кстати, я Валера. А тебя как звать?"
+        )
         await update.message.reply_text(full_response)
         user_state[user_id] = "analyzing_name"
         
@@ -262,12 +294,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 user_state[user_id] = "waiting_gender"
                 await update.message.reply_text(
-                    "Не понял. Это ты мальчик, или девочка?")
+                    "Не понял. Это ты мальчик, или девочка?"
+                )
                 return
         else:
             user_state[user_id] = "waiting_gender"
             await update.message.reply_text(
-                "Не понял. Это ты мальчик, или девочка?")
+                "Не понял. Это ты мальчик, или девочка?"
+            )
             return
             
     elif state == "waiting_gender":
@@ -299,21 +333,33 @@ async def generate_response(user_id: int, text: str) -> str:
     # Обновляем счетчик сообщений
     message_counter[user_id] = message_counter.get(user_id, 0) + 1
     
+    # Получаем конфигурацию персонажа
+    char_config = characters.get("valera", {
+        "model": "gpt-4o",
+        "temperature": 0.9
+    })
+    
     # Формируем системный промпт
     system_prompt = build_system_prompt(gender)
     
     # История сообщений
     history = user_memory.get(user_id, [])
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history[-15:])
-    messages.append({"role": "user", "content": text})
+    messages = [
+        {"role": "system", "content": system_prompt},
+        *history[-15:],
+        {"role": "user", "content": text}
+    ]
     
     # Запрос к OpenAI
     try:
         response = openai.chat.completions.create(
-            model="gpt-4о",
-            messages=messages
+            model=char_config["model"],
+            messages=messages,
+            temperature=char_config["temperature"]
         )
+        if not response.choices[0].message.content:
+            return "Чет у меня глюк. Попробуй еще раз."
+        
         reply = response.choices[0].message.content.strip()
         
         # Добавляем в память
@@ -321,7 +367,7 @@ async def generate_response(user_id: int, text: str) -> str:
         
         # Проверяем, нужно ли добавить промо-сообщение
         if (message_counter[user_id] % random.randint(10, 15) == 0 and 
-            promo_messages):
+                promo_messages):
             promo = random.choice(promo_messages)
             reply = f"{reply}\n\n{promo}"
         
